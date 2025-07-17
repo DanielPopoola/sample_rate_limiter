@@ -38,3 +38,123 @@ class TokenBucket:
 
         self._refill(key)
         return self.buckets[key]
+
+
+
+def parse_rate_limit_string(rate_string):
+    """Parse strings like '10/minute' into capacity, refill_rate, refill_time"""
+    if '/' not in rate_string:
+        raise ValueError("Rate limit string must be in the format 'N/period'")
+    
+    requests, period = rate_string.split('/')
+    requests = int(requests)
+
+    # Convert period to seconds
+    period_map = {
+        'second': 1,
+        'minute': 60,
+        'hour': 3600,
+        'day': 86400
+    }
+
+    if period not in period_map:
+        raise ValueError(f"Unsupported period: {period}. Use: {list(period_map.keys())}")
+    
+    refill_time = period_map[period]
+    capacity = requests
+    refill_rate = requests
+    
+    return capacity, refill_rate, refill_time
+
+
+def rate_limit(
+    limit: Union[int, str],
+    refill_rate: Optional[int] = None,
+    refill_time: Optional[int] = None,
+    key_func: Optional[Callable[[Request], str]] = None
+):
+    """
+    Rate limiting decorator for FastAPI endpoints.
+    
+    Args:
+        limit: Either an integer (capacity) or string like "10/minute"
+        refill_rate: Tokens to add per refill period (if using numeric format)
+        refill_time: Seconds between refills (if using numeric format)
+        key_func: Function to extract user identifier from request
+    
+    Examples:
+        @rate_limit("10/minute")
+        @rate_limit(10, 5, 60)
+        @rate_limit("20/hour", key_func=lambda req: req.headers.get("X-API-Key"))
+    """
+
+    if isinstance(limit, str):
+        if refill_rate is not None or refill_time is not None:
+            raise ValueError("Cannot specify refill rate or refill time with string format, choose either format")
+        capacity, refill_rate, refill_time = parse_rate_limit_string(limit)
+    else:
+        capacity = limit
+        if refill_rate is None or refill_time is None:
+            raise ValueError("Must specify refill_rate and refill_time with numeric format")
+        
+    bucket = TokenBucket(capacity, refill_rate, refill_time)
+
+    # Default key function uses IP address
+    def default_key_func(request):
+        return request.client.host
+
+    get_key = key_func or default_key_func
+
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            # Find the request object in the parameters
+            request = None
+            for arg in args:
+                if isinstance(arg, Request):
+                    request = arg
+                    break
+
+            if not request:
+                for value in kwargs.values():
+                    if isinstance(value, Request):
+                        request = value
+                        break
+
+            if not request:
+                raise ValueError("No Request object found in function parameters")
+            
+            # Extract user key using the provided function
+            user_key = get_key(request)
+
+            # Check rate limit
+            if bucket.allow_request(user_key):
+                return func(*args, **kwargs)
+            else:
+                # Get current token info for detailed error response
+                tokens, _  = bucket.get_token_info(user_key)
+
+                # Calculate when user can make next request
+                seconds_until_next_token = bucket.refill_time / bucket.refill_rate
+                retry_after = int(seconds_until_next_token)
+
+                # Create detailed error response with headers
+                headers = {
+                    "X-RateLimit-Limit": str(bucket.capacity),
+                    "X-RateLimit-Remaining": "0",
+                    "X-RateLimit-Reset": str(retry_after),
+                    "Retry-After": str(retry_after)
+                }
+
+                raise HTTPException(
+                    status_code=429,
+                    detail={
+                        "message": "Rate limit exceeded",
+                        "limit": bucket.capacity,
+                        "remaining": 0,
+                        "reset_in_seconds": retry_after
+                    },
+                    headers=headers
+                )
+        return wrapper
+    return decorator
